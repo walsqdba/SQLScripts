@@ -1,0 +1,22 @@
+--resource semaphore:
+SELECT
+    GETDATE() AS log_time,
+    pool_id,
+    resource_semaphore_id,
+    total_memory_kb,
+    available_memory_kb,
+    granted_memory_kb,
+    used_memory_kb,
+    grantee_count,
+    waiter_count
+FROM sys.dm_exec_query_resource_semaphores;
+
+
+
+--Waiting queries (blocked on memory grants)
+--Active queries holding memory grants
+SELECT
+    GETDATE() AS CollectionTime,
+    SUM(waiter_count) AS total_waiting_queries,
+    SUM(grantee_count) AS total_granted_queries
+FROM sys.dm_exec_query_resource_semaphores;
