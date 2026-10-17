@@ -1,0 +1,136 @@
+--(1) CPU UTILIZATION: Answers Is SQL Server CPU actually high?
+--Last hour of how much is SQL Server process versus other processes are utilizing CPU:
+
+SELECT TOP (60) DATEADD(ms, -1 * (@ts_now - [timestamp]), GETDATE()) AS [EventTime], 
+SQLProcessUtilization AS [SQLCPUPercent], 
+100 - SystemIdle - SQLProcessUtilization AS [OtherProcessCPUPercent], 
+SystemIdle AS [IdleCPUPercent], 
+B.[Process Queue Length] AS [ProcessQueueLength],
+C.[svrname] AS [svrname]
+FROM (
+SELECT record.value('(./Record/@id) [1]', 'int') AS record_id,
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS [SystemIdle], 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization) [1]', 'int') AS [SQLProcessUtilization], 
+[timestamp]
+FROM (
+SELECT [timestamp], CONVERT(xml, record) AS [record]
+FROM sys.dm_os_ring_buffers WITH (NOLOCK)
+WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' AND record LIKE N'%%'
+) AS X
+) AS y, (
+select SUM (runnable_tasks_count) as [Process Queue Length] 
+from sys.dm_os_schedulers
+where status = 'VISIBLE ONLINE'
+) AS B,
+(
+select @@SERVERNAME as [svrname]
+) AS C
+
+--(2) RUNNABLE QUEUE: Are SQL Server workers waiting for CPU?
+--Aggregated runnable_task_count across all schedulers. This gives a high-level view of CPU pressure on the server.
+SELECT 
+    GETDATE() AS log_time,
+    @@SERVERNAME AS ServerName,
+    SUM(runnable_tasks_count) AS TotalRunnableTasks,
+    COUNT(*) AS SchedulerCount,
+    SUM(runnable_tasks_count) * 1.0 / COUNT(*) AS AvgRunnablePerScheduler,
+    MAX(runnable_tasks_count) AS MaxRunnable
+FROM sys.dm_os_schedulers
+WHERE status = 'VISIBLE ONLINE';
+
+--(3) Per-scheduler runnable task count. This gives a more granular view of CPU pressure on the server.
+--Is the pressure distributed or concentrated on specific schedulers?
+SELECT 
+    GETDATE() AS log_time,
+    @@SERVERNAME AS ServerName,
+    scheduler_id,
+    runnable_tasks_count,
+    current_tasks_count,
+    active_workers_count,
+    load_factor
+FROM sys.dm_os_schedulers
+WHERE status = 'VISIBLE ONLINE';
+
+/*(4) wait stats:
+sys.dm_os_wait_stats is cumulative, so if you're doing live troubleshooting, looking at the raw values isn't particularly useful.
+
+You have two choices:
+
+Option A : use your Maintenance database historical delta data
+You said you don't want to do that for this exercise.
+
+Option B : take two snapshots manually during the incident and then calculate the differrence.
+For CPU specifically, you can focus on:
+SOS_SCHEDULER_YIELD
+and look at:
+wait_time_ms
+signal_wait_time_ms
+waiting_tasks_count
+
+The delta between the two snapshots is what matters.
+*/
+
+--IF CPU Pressure is identified, use the following to get the requests that are consuming CPU time:
+--(1)
+sp_whoisactive @get_plans=1
+
+OR
+--(2)
+--get requests with top cpu time
+SELECT TOP (20)
+    r.session_id,
+    r.cpu_time,
+    r.total_elapsed_time,
+    r.logical_reads,
+    r.wait_type,
+    r.wait_time,
+    DB_NAME(r.database_id) AS database_name,
+    r.plan_handle,
+    t.text AS batch_text
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.session_id <> @@SPID
+ORDER BY r.cpu_time DESC;
+
+--then get the plan by using the plan_handle value in the following query:
+SELECT
+    qp.query_plan
+FROM sys.dm_exec_query_plan
+(
+    0x060005000F00FF12701BC7A17102000001000000000000000000000000000000000000000000000000000000
+) AS qp;
+
+--This way you will get the queries that are consuming cpu time and investigate the plan.
+
+OR
+--(3) Get query store data for specific period of time.
+DECLARE @StartTime datetime = '2026-08-13 14:00:00';
+DECLARE @EndTime   datetime = '2026-08-13 14:15:00';
+
+SELECT TOP (20)
+    q.query_id,
+    p.plan_id,
+    OBJECT_NAME(q.object_id) AS object_name,
+    qt.query_sql_text,
+    SUM(rs.count_executions) AS execution_count,
+    SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
+    MAX(rs.max_cpu_time) / 1000.0 AS max_cpu_ms,
+    AVG(rs.avg_cpu_time) / 1000.0 AS avg_cpu_ms
+FROM sys.query_store_query AS q
+JOIN sys.query_store_query_text AS qt
+    ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan AS p
+    ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats AS rs
+    ON p.plan_id = rs.plan_id
+JOIN sys.query_store_runtime_stats_interval AS rsi
+    ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+WHERE rs.execution_type = 0
+  AND rsi.start_time < @EndTime
+  AND rsi.end_time > @StartTime
+GROUP BY
+    q.query_id,
+    p.plan_id,
+    q.object_id,
+    qt.query_sql_text
+ORDER BY total_cpu_ms DESC;
