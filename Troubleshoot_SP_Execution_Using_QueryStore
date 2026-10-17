@@ -1,0 +1,255 @@
+--First step: Get the execution runtime data for the SP from query store. This will get all execution data existing in query store. It might include several days based on query store configurations.
+--The result might have more than 1 row for the same execution time. This is because the same execution can have multiple plans, and have multiple statements, and each plan/statement can have multiple executions within the same run.
+ --Time initially retrieved in microseconds, in UTC time zone. The script will convert it to milli-seconds and local time zone.
+--The retrieved data is raw data, no aggregations.
+--For all these queries divide by 1000 to get milliseconds, divide by 1000000 to get seconds
+SELECT 
+    OBJECT_NAME(q.object_id) AS procedure_name,
+    rs.count_executions,
+    rs.avg_duration / 1000.0 AS avg_duration_ms,
+    rs.last_duration / 1000.0 AS last_duration_ms,
+    rs.max_duration / 1000.0 AS max_duration_ms,
+    rs.last_execution_time AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS last_execution_time_EST
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+WHERE OBJECT_NAME(q.object_id) = 'YourSPNameHere'
+ORDER BY rs.last_execution_time DESC;
+
+/*****************************************************GET DATA FOR SPECIFIC EXECUTION TIME + GET TOTAL DURATION FOR EACH STEP THAT HAVE MORE THAN 1 EXECUTION PER TIME.
+Aggregations (tOTAL DURATION) calculated by multiplying the average duration by the count of executions to get total duration (The last column), 
+and then calculating the average duration across all executions. The last execution time is also converted to local time zone.
+Also it filter by execution time, so you can get the data for 1 specific execution window. The execution window can be adjusted by changing the filter values in the WHERE clause.
+*/
+SELECT 
+    OBJECT_NAME(q.object_id) AS procedure_name,
+    q.query_id,
+    p.plan_id,
+    --rs.first_execution_time,
+    rs.first_execution_time AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS first_execution_time_EST,
+    --rs.last_execution_time,
+    rs.last_execution_time AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS last_execution_time_EST,
+    rs.count_executions,
+    
+    -- durations
+    rs.avg_duration / 1000000.0 AS avg_duration_sec,    --divide by 1000 to get milliseconds, divide by 1000000 to get seconds
+    rs.last_duration / 1000000.0 AS last_duration_sec,
+    rs.max_duration / 1000000.0 AS max_duration_sec,
+    rs.min_duration / 1000000.0 AS min_duration_sec,
+
+    -- total duration contribution
+    (rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_sec
+
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p 
+    ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs 
+    ON p.plan_id = rs.plan_id
+WHERE OBJECT_NAME(q.object_id) = 'YourSPNameHere'
+
+--filter to your execution window
+AND rs.last_execution_time >= '2026-08-06 14:57:00'
+AND rs.first_execution_time <= '2026-08-06 15:03:00'
+
+ORDER BY rs.last_execution_time;
+
+
+/*****************************************************IMPORTANT: GET TOTAL RUNTIME OF SP FOR SPECIFIC EXECUTION WINDOW.
+This is calculated as well by multiplying the sum of all exec counts of all steps/queries that happened during that specific window by sum of avg durations for all steps.
+*/
+SELECT 
+    MIN(rs.first_execution_time) AS window_start_utc,
+    MAX(rs.last_execution_time) AS window_end_utc,
+
+    SUM(rs.count_executions) AS total_execs,
+
+    -- weighted total duration
+    SUM(rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_sec,
+
+    -- weighted avg duration
+    SUM(rs.avg_duration * rs.count_executions) 
+        / NULLIF(SUM(rs.count_executions),0) / 1000000.0 AS avg_duration_sec
+
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p 
+    ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs 
+    ON p.plan_id = rs.plan_id
+WHERE OBJECT_NAME(q.object_id) = 'YourSPNameHere'
+AND rs.last_execution_time >= '2026-08-06 16:30:00' --This is in UTC time
+AND rs.first_execution_time <= '2026-08-06 16:34:37'; --This is in UTC time
+
+
+/*****************************************************GET TOP QUERIES THAT HAVE TOP EXECUTION TIME FOR SPECIFIC EXECUTION WINDOW.
+*/
+
+SELECT TOP 10
+    q.query_id,
+    rs.count_executions,
+    rs.avg_duration / 1000000.0 AS avg_duration_sec,
+    (rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_sec,
+
+    SUBSTRING(qt.query_sql_text, 1, 200) AS query_text
+
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt 
+    ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan p 
+    ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs 
+    ON p.plan_id = rs.plan_id
+
+WHERE OBJECT_NAME(q.object_id) = 'YourSPNameHere'
+AND rs.last_execution_time >= '2026-08-06 15:00:00'
+AND rs.first_execution_time <= '2026-08-06 15:02:37'
+
+ORDER BY total_duration_sec DESC;
+
+/*****************************************************IMPORTANT: DETAILED ONE FOR TOP QUERIES THAT HAVE TOP EXECUTION TIME FOR SPECIFIC EXECUTION WINDOW.
+*****************************************************USE THIS TO GET TOP PROBLEMATIC ONES
+RETRIEVE SAME RESULT ABOVE, BUT USE group by TO GROUP SAME QUERIES WITH SAME PLAN AND GET TOTAL EXECUTION TIME. 
+In some cases depending on your query, it might etrieve the same results as above because the SP statements have one row per result.
+*/
+SELECT TOP 10
+    q.query_id,
+
+    -- total executions of this statement in your window
+    SUM(rs.count_executions) AS total_execs,
+
+    -- weighted total duration (THIS is what you care about most)
+    SUM(rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_sec,
+
+    -- weighted average duration per execution
+    SUM(rs.avg_duration * rs.count_executions) 
+        / NULLIF(SUM(rs.count_executions),0) / 1000000.0 AS avg_duration_sec,
+
+    -- worst case observed
+    MAX(rs.max_duration) / 1000000.0 AS max_duration_sec,
+
+    -- query text
+    SUBSTRING(qt.query_sql_text, 1, 300) AS query_text
+
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt 
+    ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan p 
+    ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs 
+    ON p.plan_id = rs.plan_id
+
+WHERE OBJECT_NAME(q.object_id) = 'YourSPNameHere'
+
+-- your execution window (UTC)
+AND rs.last_execution_time >= '2026-08-06 15:00:00'
+AND rs.first_execution_time <= '2026-08-06 15:02:37'
+
+GROUP BY q.query_id, qt.query_sql_text
+
+ORDER BY total_duration_sec DESC;
+
+/*****************************************************IMPORTANT: USE QUERY ID retrieved from above TO further TROUBLESHOOT.
+This will give you th eplan runtime for all windows, which give insight on how the execution trend look like overtime. Gives good insight on runhtime info.
+*/
+SELECT 
+    p.plan_id,
+    rs.count_executions,
+
+    rs.avg_duration / 1000000.0 AS avg_duration_sec, --divide by 1000 to get milliseconds, divide by 1000000 to get seconds
+    (rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_sec,
+
+    rs.avg_cpu_time / 1000000.0 AS avg_cpu_sec,
+    (rs.avg_cpu_time * rs.count_executions) / 1000000.0 AS total_cpu_sec,
+
+    rs.avg_logical_io_reads, --This is per execution, not total. Total can be calculated by multiplying by count_executions
+    rs.avg_logical_io_writes, --This is per execution, not total. Total can be calculated by multiplying by count_executions
+    rs.avg_physical_io_reads, --This is per execution, not total. Total can be calculated by multiplying by count_executions
+
+    rs.last_execution_time
+FROM sys.query_store_plan p
+JOIN sys.query_store_runtime_stats rs 
+    ON p.plan_id = rs.plan_id
+WHERE p.query_id = 7919
+ORDER BY rs.last_execution_time DESC;
+
+/*Example of results and explanation:
+executions: 296
+avg duration: ~0.48 sec
+avg CPU: ~0.479 sec
+logical reads: ~44,327 per execution
+physical reads: ~0.04 (basically zero)
+🎯 Immediate classification
+🟥 This is CPU-bound
+
+Because:
+
+avg_cpu_sec ≈ avg_duration_sec
+
+👉 0.479 ≈ 0.480 → almost identical
+
+🟦 NOT IO-bound
+
+Because:
+
+Physical reads ≈ 0
+👉 Data is already in memory (buffer pool)
+
+So:
+
+No disk bottleneck
+No PAGEIOLATCH waits
+🟨 But there is a BIG signal:
+🚨 44,000 logical reads per execution
+
+That is VERY high
+
+👉 Multiply it:
+
+44,000 reads × 296 executions ≈ 13 MILLION logical reads
+
+💥 That’s your 2.5 minutes right there.
+
+🧠 What this actually means
+
+👉 SQL Server is:
+
+Repeatedly scanning / reading large data
+From memory (fast), but still expensive CPU-wise
+🔥 Most likely root causes
+
+Based on this pattern, the top suspects are:
+
+1. 🔴 Missing index (MOST COMMON)
+
+Symptoms:
+
+High logical reads
+CPU-bound
+Repeated execution
+
+👉 SQL is scanning way more data than needed
+
+2. 🔴 Inefficient execution plan
+
+Look for:
+
+Table scans
+Index scans (large)
+Key lookups repeated many times
+3. 🔴 RBAR / repeated execution pattern
+
+👉 296 executions per run
+
+Ask:
+
+Why is this query executed 296 times?
+
+Even a “decent” query becomes expensive when repeated
+*/
+
+--NEXT STEP CHECK THE PLAN:
+--With the plan ID for the specific row you selected, use the following query to get 
+SELECT CAST(query_plan AS XML)
+FROM sys.query_store_plan
+WHERE plan_id = 353232;
+
+
