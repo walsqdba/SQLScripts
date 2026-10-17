@@ -1,0 +1,86 @@
+--Use query store to get the last execution time and average duration of a stored procedure. You can specify the SPname in the where clause or use LIKE.
+--Times originally stored in microseconds, here divided by 1000.0 to get milliseconds.
+-- Make sure to execute this under the database where the stored procedure is located.
+--Works even after cache clears or restarts, as long as Query Store is enabled.
+--MAX(rs.max_duration) gives you the slowest observed execution.
+--AVG(rs.avg_duration) is the mean across recorded intervals, not just per execution.
+
+SELECT  
+    OBJECT_NAME(qsq.object_id, DB_ID()) AS ProcedureName,
+    MAX(rs.last_execution_time) AS last_execution_time,
+    CAST(AVG(rs.avg_duration) / 1000.0 AS DECIMAL(10,2)) AS avg_duration_ms,
+    CAST(MAX(rs.max_duration) / 1000.0 AS DECIMAL(10,2)) AS max_duration_ms
+FROM sys.query_store_query AS qsq
+JOIN sys.query_store_query_text AS qsqt
+    ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan AS qsp
+    ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_runtime_stats AS rs
+    ON qsp.plan_id = rs.plan_id
+WHERE OBJECT_NAME(qsq.object_id, DB_ID()) = 'YourStoredProc'
+GROUP BY OBJECT_NAME(qsq.object_id, DB_ID())
+ORDER BY last_execution_time DESC;
+
+--Same version of the above but don't specify a stored procedure.
+SELECT  
+    OBJECT_SCHEMA_NAME(qsq.object_id, DB_ID()) AS SchemaName,
+    OBJECT_NAME(qsq.object_id, DB_ID()) AS ProcedureName,
+    MAX(rs.last_execution_time) AS last_execution_time,
+    CAST(AVG(COALESCE(rs.avg_duration,0)) / 1000.0 AS DECIMAL(18,2)) AS avg_duration_ms,
+    CAST(MAX(COALESCE(rs.max_duration,0)) / 1000.0 AS DECIMAL(18,2)) AS max_duration_ms
+FROM sys.query_store_query AS qsq
+JOIN sys.query_store_query_text AS qsqt
+    ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan AS qsp
+    ON qsq.query_id = qsp.query_id
+LEFT JOIN sys.query_store_runtime_stats AS rs
+    ON qsp.plan_id = rs.plan_id
+GROUP BY  
+    OBJECT_SCHEMA_NAME(qsq.object_id, DB_ID()),
+    OBJECT_NAME(qsq.object_id, DB_ID())
+ORDER BY last_execution_time DESC;
+
+--Following provide aggregated data per stored procedure for daily execution. Note that this infor is not accurate mostly as it is retrieved from query store and query store has different data collection than what is actually seeked by DBAs.
+--one thing is each part of the SP, or query, query store consider it as complete execution of the SP. So the numbers of total execution and average duration are not always accurate. Unless the SP is one query together.
+--Same logic applies to average calculations of execution time. Each part of execution of SP, query store considers it as one complete execution of the SP.
+SELECT  
+    OBJECT_SCHEMA_NAME(qsq.object_id, DB_ID()) AS SchemaName,
+    OBJECT_NAME(qsq.object_id, DB_ID()) AS ProcedureName,
+    CAST(rs.last_execution_time AS DATE) AS execution_date,
+    SUM(rs.count_executions) AS total_executions,
+    CAST(SUM((rs.avg_duration / 1000.0) * rs.count_executions) AS DECIMAL(18,2)) AS total_duration_ms,
+    CAST(
+        CASE 
+            WHEN SUM(rs.count_executions) = 0 THEN 0
+            ELSE SUM((rs.avg_duration / 1000.0) * rs.count_executions) / SUM(rs.count_executions) 
+        END 
+    AS DECIMAL(18,2)) AS avg_duration_per_execution_ms
+FROM sys.query_store_query AS qsq
+JOIN sys.query_store_query_text AS qsqt
+    ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan AS qsp
+    ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_runtime_stats AS rs
+    ON qsp.plan_id = rs.plan_id
+--WHERE OBJECT_SCHEMA_NAME(qsq.object_id, DB_ID()) = 'YourSchema'  
+--  AND OBJECT_NAME(qsq.object_id, DB_ID()) = 'YourStoredProc'
+GROUP BY  
+    OBJECT_SCHEMA_NAME(qsq.object_id, DB_ID()),
+    OBJECT_NAME(qsq.object_id, DB_ID()),
+    CAST(rs.last_execution_time AS DATE)
+ORDER BY execution_date DESC;
+
+
+
+
+--Using sys.dm_exec_query_stats which uses the plan cache. This is a good way to get the last execution time and average duration of a stored procedure.
+--Works only if the plan is still in cache. (restart, recompile or memory pressure can clear the cache).
+--Make sure to execute this under the database where the stored procedure is located.
+SELECT  
+    OBJECT_NAME(object_id, database_id) AS ProcedureName,
+    last_execution_time,
+    CAST(last_elapsed_time / 1000.0 AS DECIMAL(10,2)) AS last_elapsed_time_ms
+FROM sys.dm_exec_procedure_stats
+WHERE OBJECT_NAME(object_id, database_id) = 'YourStoredProc'
+  AND database_id = DB_ID()
+ORDER BY last_execution_time DESC;
